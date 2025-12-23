@@ -11,13 +11,14 @@ This repository helps in managing TV Shows with Notion. Follow the instructions 
 ## Requirements
 
 * [Notion API Key / Custom Integration](https://developers.notion.com/docs/create-a-notion-integration)
+* [TMDb API Key](https://www.themoviedb.org/settings/api) - Required for movie support
 
 ## Add-Ons
 
 ### Pushover
 If you'd like to receive notifications when new shows are processed or error details pushed to your mobile device, Pushover is supported.
 
-In the `docker-compose.yaml` file - configure `USE_PUSHOVER=yes` and enter your Token and User Keys in the lines provided. 
+In the `docker-compose.yaml` file - configure `USE_PUSHOVER=yes` and enter your Token and User Keys in the lines provided.
 * [Pushover](https://pushover.net/)
 
 ### AWS S3 Bucket for Banner Style Page Covers
@@ -25,7 +26,7 @@ In the `docker-compose.yaml` file - configure `USE_PUSHOVER=yes` and enter your 
 
 If you want the app to generate banner style Notion Page Covers like the image above, you'll need to have an AWS S3 bucket. This will allow the app to upload and store the images in a location where Notion can import them.
 
-In the `docker-compose.yaml` file - configure `USE_AWS=yes` and enter your Access and Secret Keys in the lines provided. 
+In the `docker-compose.yaml` file - configure `USE_AWS=yes` and enter your Access and Secret Keys in the lines provided.
 
 # Installation
 
@@ -42,13 +43,15 @@ cd notion-tv
 
 For the app to run,  you must edit the `docker-compose.yaml` fle and configure the following environment variables with the appropriate values.
 
-            - USE_AWS=yes/no            
+            - USE_AWS=yes/no
             - AWS_ACCESS_KEY_ID=ENTER-YOUR-ACCESS-KEY-HERE
             - AWS_SECRET_ACCESS_KEY=ENTER-YOUR-SECRET-KEY-HERE
             - AWS_BUCKET=bucket-name
+            - AWS_REGION=aws-region
             - NOTION_TOKEN=notion_secret
             - NOTION_DATABASE_ID=notion-database-id
             - GoogleAPIKey=Google-Books-API-Key
+            - TMDB_API_KEY=your-tmdb-api-key
             - USE_PUSHOVER=yes/no
             - PO_TOKEN=pushover-app-API-key
             - PO_USER=pushover_user_key
@@ -97,9 +100,11 @@ Copy the following and edit the environment variables
                 - AWS_ACCESS_KEY_ID=ENTER-YOUR-ACCESS-KEY-HERE
                 - AWS_SECRET_ACCESS_KEY=ENTER-YOUR-SECRET-KEY-HERE
                 - AWS_BUCKET=bucket-name
+                - AWS_REGION=aws-region
                 - NOTION_TOKEN=notion_secret
                 - NOTION_DATABASE_ID=notion-database-id
                 - GoogleAPIKey=Google-Books-API-Key
+                - TMDB_API_KEY=your-tmdb-api-key
                 - USE_PUSHOVER=yes/no
                 - PO_TOKEN=pushover-app-API-key
                 - PO_USER=pushover_user_key
@@ -109,12 +114,16 @@ Copy the following and edit the environment variables
 Once the application is running, you should be able to view the logs or in the console see the status, which should read...
 'Next scan scheduled...'
 
-The app will check your Notion database every 60 seconds for new tv shows. To create a new tv show:
+The app will check your Notion database every 60 seconds for new TV shows and movies. To create a new entry:
 
 1. Duplicate the [TV Tracker Template](https://allaboutduncan.notion.site/112ba329f59a805da992cd5aa028efb3?v=112ba329f59a8168aed8000ce50de6e3)
-2. Create a new database entry / tv show
-3. Enter the TV Show name
-4. Wait for the data to be popluated (when the process runs every 60-seconds)
+2. Create a new database entry
+3. Set the **Type** field to either "TV Serie" or "Movie"
+4. Enter the TV Show or Movie name
+5. Wait for the data to be populated (when the process runs every 60-seconds)
+
+**For TV Shows:** Data is retrieved from TVMaze API
+**For Movies:** Data is retrieved from TMDb API
 
 The app will also run every Sunday night to check for show status changes & new episodes and update all entries if anything has changed.
 
