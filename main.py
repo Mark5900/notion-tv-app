@@ -20,6 +20,7 @@ TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
 USE_PUSHOVER = os.getenv("USE_PUSHOVER", "no")  # Default to 'no' if USE_PUSHOVER is not set
 USE_AWS = os.getenv("USE_AWS", "no")  # Default to 'no' if USE_AWS is not set
+AWS_CLEANUP = os.getenv("AWS_CLEANUP", "no")  # Default to 'no' if AWS_CLEANUP is not set
 BUCKET = os.getenv("AWS_BUCKET")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")  # Default to 'us-east-1' if not set
 
@@ -194,6 +195,61 @@ def new_ep_check():
             update_tv_data(tv_data,page_id)
       except KeyError as e:
          print(f"Error processing page {page['id']}: {e} key not found.")
+
+def cleanup_aws_images():
+   """Delete unused images from AWS S3 that don't match any current page ID"""
+   if USE_AWS.lower() != "yes":
+      logging.info("AWS is not enabled, skipping cleanup")
+      return
+
+   if AWS_CLEANUP.lower() != "yes":
+      logging.info("AWS_CLEANUP is not enabled, skipping cleanup")
+      return
+
+   logging.info("Starting AWS S3 cleanup...")
+
+   # Get all current page IDs from Notion
+   pages = get_pages()
+   current_page_ids = set()
+   for page in pages:
+      page_id = page["id"]
+      current_page_ids.add(f"{page_id}.jpg")
+      current_page_ids.add(f"{page_id}_poster.jpg")
+
+   logging.info(f"Found {len(pages)} active pages in Notion")
+
+   # List all objects in S3 bucket
+   s3_client = boto3.client('s3', region_name=AWS_REGION)
+   try:
+      response = s3_client.list_objects_v2(Bucket=BUCKET)
+
+      if 'Contents' not in response:
+         logging.info("No objects found in S3 bucket")
+         return
+
+      deleted_count = 0
+      for obj in response['Contents']:
+         key = obj['Key']
+
+         # Check if this image file is not in current page IDs
+         if key.endswith('.jpg') and key not in current_page_ids:
+            logging.info(f"Deleting unused image: {key}")
+            s3_client.delete_object(Bucket=BUCKET, Key=key)
+            deleted_count += 1
+
+      logging.info(f"AWS S3 cleanup completed. Deleted {deleted_count} unused images.")
+
+      if USE_PUSHOVER.lower() == "yes":
+         subject = "AWS S3 Cleanup Completed"
+         message = f"Deleted {deleted_count} unused images from S3 bucket"
+         send_push(subject, message)
+
+   except ClientError as e:
+      logging.error(f"Error during S3 cleanup: {e}")
+      if USE_PUSHOVER.lower() == "yes":
+         subject = "AWS S3 Cleanup Failed"
+         message = str(e)
+         send_push(subject, message)
 
 def read_pages():
    pages = get_pages()
@@ -533,6 +589,13 @@ def update_tv_data(tv_data,page_id):
       os.remove(page_id+".jpg")
       if os.path.exists(page_id+"_poster.jpg"):
           os.remove(page_id+"_poster.jpg")
+
+# Run cleanup once at startup if enabled
+if AWS_CLEANUP.lower() == "yes":
+    cleanup_aws_images()
+    # Schedule daily cleanup
+    schedule.every().day.do(cleanup_aws_images)
+    logging.info("AWS cleanup scheduled to run daily")
 
 schedule.every(60).seconds.do(read_pages)
 schedule.every().sunday.do(new_ep_check)
