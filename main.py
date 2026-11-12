@@ -1,16 +1,15 @@
-import requests
-from datetime import datetime, timezone
-import time
-import schedule
-from PIL import Image, ImageFilter
-import urllib
 import logging
-import boto3
-from botocore.exceptions import ClientError
 import os
-import json
+import time
+import urllib.request
+
+import boto3
+import requests
+import schedule
+from botocore.exceptions import BotoCoreError, ClientError
 from bs4 import BeautifulSoup
-from pushover import Pushover
+from datetime import datetime
+from PIL import Image, ImageFilter
 
 # Constants and Configuration
 SERVICE_NAME = "Notion TV"
@@ -18,20 +17,21 @@ NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
-USE_PUSHOVER = os.getenv("USE_PUSHOVER", "no")  # Default to 'no' if USE_PUSHOVER is not set
-USE_AWS = os.getenv("USE_AWS", "no")  # Default to 'no' if USE_AWS is not set
-AWS_CLEANUP = os.getenv("AWS_CLEANUP", "no")  # Default to 'no' if AWS_CLEANUP is not set
+USE_PUSHOVER = os.getenv("USE_PUSHOVER", "no").lower() == "yes"
+USE_AWS = os.getenv("USE_AWS", "no").lower() == "yes"
+AWS_CLEANUP = os.getenv("AWS_CLEANUP", "no").lower() == "yes"
 BUCKET = os.getenv("AWS_BUCKET")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")  # Default to 'us-east-1' if not set
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+PO_USER = os.getenv("PO_USER")
+PO_TOKEN = os.getenv("PO_TOKEN")
 
-if USE_AWS.lower() == "yes":
-    BUCKET = os.getenv("AWS_BUCKET")
+# Select option names as they exist in the Notion database
+TYPE_TV = "TV serie"
+TYPE_MOVIE = "Movie"
 
-if USE_PUSHOVER.lower() == "yes":
-    PO_USER = os.getenv("PO_USER")
-    PO_TOKEN = os.getenv("PO_TOKEN")
-    po = Pushover(PO_TOKEN)
-    po.user(PO_USER)
+NOTION_SUMMARY_LIMIT = 2000
+HTTP_TIMEOUT = 30
+PLACEHOLDER_IMAGE = "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,570 +39,423 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 
+if not NOTION_TOKEN or not DATABASE_ID:
+    raise SystemExit("NOTION_TOKEN and NOTION_DATABASE_ID must be set")
+
 NOTION_headers = {
     "Authorization": "Bearer " + NOTION_TOKEN,
     "Content-Type": "application/json",
     "Notion-Version": "2022-06-28",
 }
 
-def send_push(subject,message):
-  msg = po.msg(message)
-  msg.set("title", subject)
-  po.send(msg)
+# Lookups that found nothing, keyed by (page_id, title). A page is retried
+# only when its title changes, so unknown titles are not searched every minute.
+failed_lookups = set()
+
+
+# ---------------------------------------------------------------- helpers
+
+def send_push(subject, message):
+    """Send a Pushover notification; does nothing when Pushover is disabled."""
+    if not USE_PUSHOVER or not PO_TOKEN or not PO_USER:
+        return
+    try:
+        requests.post(
+            "https://api.pushover.net/1/messages.json",
+            data={"token": PO_TOKEN, "user": PO_USER,
+                  "title": str(subject), "message": str(message)},
+            timeout=HTTP_TIMEOUT,
+        )
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Pushover failed: {e}")
+
 
 def status():
-    current_time = str(datetime.now())
-    subject = SERVICE_NAME + " is online"
-    message = SERVICE_NAME + " is online and running at " + current_time
-    send_push(subject,message)
+    send_push(SERVICE_NAME + " is online",
+              f"{SERVICE_NAME} is online and running at {datetime.now()}")
+
 
 def remove_html(input_string):
-    soup = BeautifulSoup(input_string, "html.parser")
-    return soup.get_text()
+    if not input_string:
+        return ""
+    return BeautifulSoup(input_string, "html.parser").get_text()
 
-def upload_file(file_name,object_name):
-    # print("Start File Uplaod")
-    # If S3 object_name was not specified, use file_name
+
+def get_json(url, params=None):
+    """GET a JSON document. Returns None on 404 or any request error."""
+    try:
+        response = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+        if response.status_code == 404:
+            return None
+        if response.status_code == 429:  # TVmaze rate limit
+            time.sleep(10)
+            response = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+        response.raise_for_status()
+        return response.json()
+    except (requests.exceptions.RequestException, ValueError) as e:
+        logging.error(f"Request to {url} failed: {e}")
+        return None
+
+
+def get_title(props):
+    title = props.get("Name", {}).get("title") or []
+    return "".join(part.get("plain_text") or part.get("text", {}).get("content", "")
+                   for part in title).strip()
+
+
+def get_select(props, name):
+    select = (props.get(name) or {}).get("select")
+    return select.get("name") if select else None
+
+
+def get_number(props, name):
+    return (props.get(name) or {}).get("number")
+
+
+def date_value(value):
+    return {"start": value} if value else None
+
+
+def rich_text(value):
+    return [{"type": "text", "text": {"content": (value or "")[:NOTION_SUMMARY_LIMIT]}}]
+
+
+def title_text(value):
+    return [{"type": "text", "text": {"content": value}}]
+
+
+def episode_id_from_link(tv_data, link_name):
+    href = ((tv_data.get("_links") or {}).get(link_name) or {}).get("href")
+    if not href:
+        return None
+    try:
+        return int(href.rstrip("/").split("/episodes/")[-1])
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------- AWS
+
+def upload_file(file_name, object_name=None):
     if object_name is None:
         object_name = os.path.basename(file_name)
-    # Upload the file
-    s3_client = boto3.client('s3', region_name=AWS_REGION)
     try:
-        response = s3_client.upload_file(file_name, BUCKET, object_name)
-        print(response)
-    except ClientError as e:
-        logging.error(e)
-        print.error(e)
+        boto3.client("s3", region_name=AWS_REGION).upload_file(file_name, BUCKET, object_name)
+        return True
+    except (ClientError, BotoCoreError) as e:
+        logging.error(f"S3 upload of {object_name} failed: {e}")
         return False
-    return True
 
-def get_tv_by_name(new_tv_title):
-    # print("TV Title for API: "+new_tv_title)
-    base_url = 'https://api.tvmaze.com/singlesearch/shows?q='+new_tv_title
-    # print(base_url)
-    try:
-        response = requests.get(base_url)
-        print(response)
-        response.raise_for_status()
-        tv_data = response.json()
-        return tv_data
-    except requests.exceptions.RequestException as e:
-        print(f"Error: {e}")
-        return None
 
-def get_tv_by_id(tv_id):
-    tv_id = str(tv_id)
-    base_url = 'https://api.tvmaze.com/shows/'+tv_id
-    # print(base_url)
-    try:
-        response = requests.get(base_url)
-        response.raise_for_status()
-        tv_data = response.json()
-        return tv_data
-    except requests.exceptions.RequestException as e:
-        print(f"Error: {e}")
-        return None
+def s3_url(object_name):
+    return f"https://{BUCKET}.s3.{AWS_REGION}.amazonaws.com/{object_name}"
 
-def get_seasons(tv_id):
-    tv_id = str(tv_id)
-    base_url = 'https://api.tvmaze.com/shows/'+tv_id+'/seasons'
-    # print("Extended Series Details: "+base_url)
-    try:
-        response = requests.get(base_url)
-        print(response)
-        response.raise_for_status()
-        tv_data = response.json()
-        # print("Print Extended Details: ")
-        print(tv_data)
-        return tv_data
-    except requests.exceptions.RequestException as e:
-        print(f"Error: {e}")
-        return None
 
-def get_movie_by_name(movie_title):
-    """Search for a movie on TMDb API by name"""
-    base_url = f'https://api.themoviedb.org/3/search/movie?api_key={TMDB_API_KEY}&query={movie_title}'
-    try:
-        response = requests.get(base_url)
-        logging.info(f"TMDb API response: {response.status_code}")
-        response.raise_for_status()
-        data = response.json()
-        if data['results']:
-            movie_id = data['results'][0]['id']
-            return get_movie_by_id(movie_id)
-        else:
-            logging.warning(f"No movie found for '{movie_title}'")
-            return None
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error searching TMDb: {e}")
-        return None
+def make_images(img_url, page_id):
+    """Return (cover_url, poster_url).
 
-def get_movie_by_id(movie_id):
-    """Get detailed movie information from TMDb API by ID"""
-    base_url = f'https://api.themoviedb.org/3/movie/{movie_id}?api_key={TMDB_API_KEY}'
-    try:
-        response = requests.get(base_url)
-        response.raise_for_status()
-        movie_data = response.json()
-        logging.info(f"Found movie: {movie_data.get('title', 'Unknown')}")
-        return movie_data
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error fetching movie details: {e}")
-        return None
-
-def get_pages(num_pages=None):
+    With AWS enabled a blurred banner and a resized poster are built and
+    uploaded to S3. Without AWS, or if anything fails, the source image is used.
     """
-    If num_pages is None, get all pages, otherwise just the defined number.
-    """
-    url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
-    get_all = num_pages is None
-    page_size = 100 if get_all else num_pages
-    payload = {"page_size": page_size}
-    logging.info(f"Fetching pages from Notion database: {DATABASE_ID}")
-    response = requests.post(url, json=payload, headers=NOTION_headers)
-    data = response.json()
+    if not img_url:
+        return PLACEHOLDER_IMAGE, PLACEHOLDER_IMAGE
+    if not USE_AWS:
+        return img_url, img_url
 
-    if "results" not in data:
-        logging.error(f"Error fetching Notion pages: {data}")
-        return []
+    img_name = f"{page_id}.jpg"
+    poster_name = f"{page_id}_poster.jpg"
+    try:
+        urllib.request.urlretrieve(img_url, img_name)
+        img = Image.open(img_name).convert("RGB")
+        width, height = img.size
 
-    results = data["results"]
-    logging.info(f"Found {len(results)} pages in Notion database")
-    while data["has_more"] and get_all:
-        payload = {"page_size": page_size, "start_cursor": data["next_cursor"]}
-        url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
-        response = requests.post(url, json=payload, headers=NOTION_headers)
-        data = response.json()
-        results.extend(data["results"])
-    return results
+        new_height = 600
+        img_poster = img.resize((int(new_height * width / height), new_height))
+        img_poster.save(poster_name)
 
-def new_ep_check():
-   pages = get_pages()
-   for page in pages:
-      try:
-         page_id = page["id"]
-         props = page["properties"]
-         tv_id = props["tvmazeID"]["number"]
-         title = props["Name"]["title"][0]["text"]["content"]
-         last_id = props["Last Aired Episode"]["number"]
-         tv_data = get_tv_by_id(tv_id)
-         last_episode = tv_data['_links']['previousepisode']['href']
-         last_episode = last_episode.split("/episodes/")[-1]
-         last_episode = int(last_episode)
+        banner = img.crop((5, height / 3, width, 2 * height / 3)).resize((1500, 600))
+        banner = banner.filter(ImageFilter.BoxBlur(30))
+        banner.paste(img_poster, (max(0, (1500 - img_poster.width) // 2), 0))
+        banner.save(img_name)
 
-         if last_id != last_episode:
-            print("New epsiode of "+title+" is schedule. We need to update!")
-            update_tv_data(tv_data,page_id)
-      except KeyError as e:
-         print(f"Error processing page {page['id']}: {e} key not found.")
+        if upload_file(poster_name) and upload_file(img_name):
+            return s3_url(img_name), s3_url(poster_name)
+        return img_url, img_url
+    except Exception as e:
+        logging.error(f"Could not build banner for {page_id}: {e}")
+        return img_url, img_url
+    finally:
+        for name in (img_name, poster_name):
+            if os.path.exists(name):
+                os.remove(name)
+
 
 def cleanup_aws_images():
-   """Delete unused images from AWS S3 that don't match any current page ID"""
-   if USE_AWS.lower() != "yes":
-      logging.info("AWS is not enabled, skipping cleanup")
-      return
+    """Delete images in S3 that don't belong to any current Notion page."""
+    if not USE_AWS or not AWS_CLEANUP:
+        return
+    logging.info("Starting AWS S3 cleanup...")
+    pages = get_pages()
+    if not pages:
+        logging.warning("No pages returned from Notion, skipping cleanup")
+        return
+    keep = set()
+    for page in pages:
+        keep.add(f"{page['id']}.jpg")
+        keep.add(f"{page['id']}_poster.jpg")
 
-   if AWS_CLEANUP.lower() != "yes":
-      logging.info("AWS_CLEANUP is not enabled, skipping cleanup")
-      return
+    s3_client = boto3.client("s3", region_name=AWS_REGION)
+    deleted = 0
+    try:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        for result in paginator.paginate(Bucket=BUCKET):
+            for obj in result.get("Contents", []):
+                key = obj["Key"]
+                if key.endswith(".jpg") and key not in keep:
+                    s3_client.delete_object(Bucket=BUCKET, Key=key)
+                    deleted += 1
+        logging.info(f"AWS S3 cleanup completed. Deleted {deleted} unused images.")
+        send_push("AWS S3 Cleanup Completed", f"Deleted {deleted} unused images from S3 bucket")
+    except (ClientError, BotoCoreError) as e:
+        logging.error(f"Error during S3 cleanup: {e}")
+        send_push("AWS S3 Cleanup Failed", e)
 
-   logging.info("Starting AWS S3 cleanup...")
 
-   # Get all current page IDs from Notion
-   pages = get_pages()
-   current_page_ids = set()
-   for page in pages:
-      page_id = page["id"]
-      current_page_ids.add(f"{page_id}.jpg")
-      current_page_ids.add(f"{page_id}_poster.jpg")
+# ---------------------------------------------------------------- TVmaze
 
-   logging.info(f"Found {len(pages)} active pages in Notion")
+def get_tv_by_name(title):
+    return get_json("https://api.tvmaze.com/singlesearch/shows", {"q": title})
 
-   # List all objects in S3 bucket
-   s3_client = boto3.client('s3', region_name=AWS_REGION)
-   try:
-      response = s3_client.list_objects_v2(Bucket=BUCKET)
 
-      if 'Contents' not in response:
-         logging.info("No objects found in S3 bucket")
-         return
+def get_tv_by_id(tv_id):
+    if tv_id is None:
+        return None
+    return get_json(f"https://api.tvmaze.com/shows/{int(tv_id)}")
 
-      deleted_count = 0
-      for obj in response['Contents']:
-         key = obj['Key']
 
-         # Check if this image file is not in current page IDs
-         if key.endswith('.jpg') and key not in current_page_ids:
-            logging.info(f"Deleting unused image: {key}")
-            s3_client.delete_object(Bucket=BUCKET, Key=key)
-            deleted_count += 1
+def get_episode_stats(tv_id):
+    """Return (season_count, episode_count) for regular episodes, specials excluded.
 
-      logging.info(f"AWS S3 cleanup completed. Deleted {deleted_count} unused images.")
+    TVmaze's per-season episodeOrder is often empty, so the episode list is
+    counted instead. Scheduled future episodes are included.
+    """
+    episodes = get_json(f"https://api.tvmaze.com/shows/{int(tv_id)}/episodes")
+    if episodes:
+        regular = [ep for ep in episodes if ep.get("type", "regular") == "regular"]
+        seasons = {ep.get("season") for ep in regular if ep.get("season") is not None}
+        return len(seasons), len(regular)
 
-      if USE_PUSHOVER.lower() == "yes":
-         subject = "AWS S3 Cleanup Completed"
-         message = f"Deleted {deleted_count} unused images from S3 bucket"
-         send_push(subject, message)
+    seasons = get_json(f"https://api.tvmaze.com/shows/{int(tv_id)}/seasons") or []
+    return len(seasons), sum(s.get("episodeOrder") or 0 for s in seasons)
 
-   except ClientError as e:
-      logging.error(f"Error during S3 cleanup: {e}")
-      if USE_PUSHOVER.lower() == "yes":
-         subject = "AWS S3 Cleanup Failed"
-         message = str(e)
-         send_push(subject, message)
 
-def read_pages():
-   pages = get_pages()
-   logging.info(f"Processing {len(pages)} pages from Notion")
+def update_tv_data(tv_data, page_id):
+    tv_id = tv_data["id"]
+    name = tv_data.get("name")
+    logging.info(f"Updating TV show '{name}' (tvmaze {tv_id})")
 
-   for page in pages:
-      try:
-         page_id = page["id"]
-         props = page["properties"]
-         title = props["Name"]["title"][0]["text"]["content"]
+    season_count, total_episodes = get_episode_stats(tv_id)
+    img_url = (tv_data.get("image") or {}).get("original")
+    cover, poster = make_images(img_url, page_id)
 
-         # Get Type field (Movie or TV Serie)
-         content_type = props.get("Type", {}).get("select", {}).get("name", "TV Serie")
-         logging.info(f"Processing: {title} (Type: {content_type})")
+    properties = {
+        "TVDBID": {"number": (tv_data.get("externals") or {}).get("thetvdb")},
+        "tvmazeID": {"number": tv_id},
+        "Type": {"select": {"name": TYPE_TV}},
+        "Premiered": {"date": date_value(tv_data.get("premiered"))},
+        "Ended": {"date": date_value(tv_data.get("ended"))},
+        "Last Aired Episode": {"number": episode_id_from_link(tv_data, "previousepisode")},
+        "Seasons": {"number": season_count},
+        "Total Eps.": {"number": total_episodes},
+        "Summary": {"rich_text": rich_text(remove_html(tv_data.get("summary")))},
+        "Poster": {"files": [{"name": "Poster", "type": "external", "external": {"url": poster}}]},
+    }
+    if tv_data.get("status"):
+        properties["Show Status"] = {"select": {"name": tv_data["status"]}}
+    if name:
+        properties["Name"] = {"title": title_text(name)}
 
-         if content_type == "Movie":
-            # Handle movies with TMDb
-            tmdb_id = props.get("tmdbID", {}).get("number")
-            if tmdb_id is None:
-               logging.info(f"No tmdbID found for movie '{title}', searching TMDb API...")
-               search_title = title.replace(';', '').replace(' ', '+')
-               movie_data = get_movie_by_name(search_title)
-               if movie_data:
-                  logging.info(f"Found movie data for '{title}', updating Notion...")
-                  update_movie_data(movie_data, page_id)
-               else:
-                  logging.warning(f"Could not find movie '{title}' on TMDb")
-            else:
-               logging.info(f"Movie '{title}' already has tmdbID, skipping")
-         else:
-            # Handle TV shows with TVMaze
-            tvmazeID = props.get("tvmazeID", {}).get("number")
-            if tvmazeID is None:
-               logging.info(f"No tvmazeID found for TV show '{title}', searching TVMaze API...")
-               new_tv_title = title.replace(';', '')
-               new_tv_title = new_tv_title.replace(' ', '+')
-               tv_data = get_tv_by_name(new_tv_title)
-               if tv_data:
-                  logging.info(f"Found TV data for '{title}', updating Notion...")
-                  update_tv_data(tv_data,page_id)
-               else:
-                  logging.warning(f"Could not find TV data for '{title}' on TVMaze")
-            else:
-               logging.info(f"Show '{title}' already has tvmazeID, skipping")
-      except KeyError as e:
-         logging.error(f"Error processing page {page.get('id', 'unknown')}: {e} key not found.")
-         try:
-            if USE_PUSHOVER.lower() == "yes":
-               subject = f"Error reading data from Notion for {title}"
-               message = str(e)
-               send_push(subject,message)
-         except:
-            pass
-      except Exception as e:
-         logging.error(f"Unexpected error processing page: {e}")
+    return update_page(page_id, {"cover": {"external": {"url": cover}}, "properties": properties})
 
-def update_page(page_id: str, data: dict):
-    print("Start Update_Page function")
-    url = f"https://api.notion.com/v1/pages/{page_id}"
-    print(url)
-    payload = data
-    print(payload)
-    res = requests.patch(url, json=payload, headers=NOTION_headers)
-    if res.status_code == 200:
-        print('Details updated successfully!')
-    else:
-        print(f'Notion update request failed with status code: {res.status_code}')
-        try:
-            json_data = res.json()
-            logging.error(f"Error response: {json_data}")
-            if USE_PUSHOVER.lower() == "yes":
-                subject = f"{json_data.get('status', 'Error')}: {json_data.get('code', 'Unknown')}"
-                message = json_data.get('message', 'No error message')
-                send_push(subject, message)
-        except Exception as e:
-            logging.error(f"Could not parse error response: {e}")
-    return res
 
-def make_banner(img_url,page_id):
-   # sizing from each image "_V1_SX300."
-   img_name = str(page_id+".jpg")
-   poster_name = str(page_id+"_poster.jpg")
-   urllib.request.urlretrieve(img_url,img_name)
+# ---------------------------------------------------------------- TMDb
 
-   img = Image.open(img_name)
-   width, height = img.size
+def get_movie_by_name(title):
+    if not TMDB_API_KEY:
+        logging.warning("TMDB_API_KEY is not set, cannot look up movies")
+        return None
+    data = get_json("https://api.themoviedb.org/3/search/movie",
+                    {"api_key": TMDB_API_KEY, "query": title})
+    if not data or not data.get("results"):
+        return None
+    return get_movie_by_id(data["results"][0]["id"])
 
-   new_height = 600
-   new_width  = new_height * width / height
 
-   postersize = (int(new_width), new_height)
-   img_poster = img.resize(postersize)
-   # Save and upload poster separately
-   img_poster.save(poster_name)
-   if USE_AWS.lower() == "yes":
-      upload_file(poster_name, poster_name)
+def get_movie_by_id(movie_id):
+    if not TMDB_API_KEY or movie_id is None:
+        return None
+    return get_json(f"https://api.themoviedb.org/3/movie/{int(movie_id)}",
+                    {"api_key": TMDB_API_KEY})
 
-   left = 5
-   top = height / 3
-   right = width
-   bottom = 2 * height / 3
-
-   # Cropped image of above dimension
-   img = img.crop((left, top, right, bottom))
-   newsize = (1500, 600)
-   img_banner = img.resize(newsize)
-   img_banner = img_banner.filter(ImageFilter.BoxBlur(30))
-   # img_banner.show()
-
-   background = img_banner
-   foreground = img_poster
-   background.paste(foreground, (514,0))
-   background.save(img_name)
-   if USE_AWS.lower() == "yes":
-      upload_file(img_name,img_name)
-   # background.show()
-   return background
 
 def update_movie_data(movie_data, page_id):
-      """Update Notion with movie data from TMDb"""
-      logging.info("Start Movie Update")
+    name = movie_data.get("title")
+    logging.info(f"Updating movie '{name}' (tmdb {movie_data['id']})")
 
-      # Extract movie data
-      name = movie_data['title']
-      tmdb_id = movie_data['id']
-      status = movie_data.get('status', 'Released')
-      release_date = movie_data.get('release_date')
-      summary = movie_data.get('overview', '')
-      runtime = movie_data.get('runtime', 0)
+    poster_path = movie_data.get("poster_path")
+    img_url = f"https://image.tmdb.org/t/p/original{poster_path}" if poster_path else None
+    cover, poster = make_images(img_url, page_id)
 
-      # Get poster image
-      poster_path = movie_data.get('poster_path')
-      if poster_path:
-          img_url = f"https://image.tmdb.org/t/p/original{poster_path}"
-          make_banner(img_url, page_id)
+    properties = {
+        "tmdbID": {"number": movie_data["id"]},
+        "Type": {"select": {"name": TYPE_MOVIE}},
+        "Premiered": {"date": date_value(movie_data.get("release_date"))},
+        "Runtime": {"number": movie_data.get("runtime") or None},
+        "Summary": {"rich_text": rich_text(movie_data.get("overview"))},
+        "Poster": {"files": [{"name": "Poster", "type": "external", "external": {"url": poster}}]},
+    }
+    if movie_data.get("status"):
+        properties["Show Status"] = {"select": {"name": movie_data["status"]}}
+    if name:
+        properties["Name"] = {"title": title_text(name)}
 
-          if USE_AWS.lower() == "yes":
-              banner = f"https://{BUCKET}.s3.{AWS_REGION}.amazonaws.com/{page_id}.jpg"
-              poster = f"https://{BUCKET}.s3.{AWS_REGION}.amazonaws.com/{page_id}_poster.jpg"
-          else:
-              banner = img_url
-              poster = img_url
-      else:
-          banner = "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"
-          poster = banner
-
-      # Prepare dates
-      premiered = {"start": release_date} if release_date else None
-
-      # Build Notion update
-      update_data = {
-          "cover": {
-              "external": {
-                  "url": banner
-              }
-          },
-          "properties": {
-              "tmdbID": {
-                  "number": tmdb_id
-              },
-              "Type": {
-                  "select": {
-                      "name": "Movie"
-                  }
-              },
-              "Show Status": {
-                  "select": {
-                      "name": status
-                  }
-              },
-              "Premiered": {
-                  "type": "date",
-                  "date": premiered
-              },
-              "Runtime": {
-                  "number": runtime
-              },
-              "Poster": {
-                  "type": "files",
-                  "files": [
-                      {
-                          "name": "Poster",
-                          "type": "external",
-                          "external": {
-                              "url": poster
-                          }
-                      }
-                  ]
-              },
-              "Summary": {
-                  "type": "rich_text",
-                  "rich_text": [
-                      {
-                          "type": "text",
-                          "text": {
-                              "content": summary[:2000]  # Notion has a 2000 char limit
-                          }
-                      }
-                  ]
-              },
-              "Name": {
-                  "type": "title",
-                  "title": [
-                      {
-                          "type": "text",
-                          "text": {
-                              "content": name
-                          }
-                      }
-                  ]
-              }
-          }
-      }
-
-      update_page(page_id, update_data)
-
-      # Cleanup
-      if os.path.exists(page_id+".jpg"):
-          os.remove(page_id+".jpg")
-      if os.path.exists(page_id+"_poster.jpg"):
-          os.remove(page_id+"_poster.jpg")
-
-def update_tv_data(tv_data,page_id):
-      print("Start TV Update")
-      #  tv_data = get_tv_by_name(new_tv_title)
-      img_url = tv_data['image']['original']
-      thetvdb = tv_data['externals']['thetvdb']
-      tv_id = tv_data['id']
-      status = tv_data['status']
-      name = tv_data['name']
-      if tv_data['premiered'] is None:
-          premiered = tv_data['premiered']
-      else:
-          premiered = {"start":tv_data['premiered']}
-      if tv_data['ended'] is None:
-          ended = tv_data['ended']
-      else:
-          ended = {"start":tv_data['ended']}
-      last_episode = tv_data['_links']['previousepisode']['href']
-      last_episode = last_episode.split("/episodes/")[-1]
-      last_episode = int(last_episode)
-      summary = remove_html(tv_data['summary'])
-      season_data = get_seasons(tv_id)
-      season_count = sum("episodeOrder" in item for item in season_data)
-      total_episodes = sum(item["episodeOrder"] for item in season_data if "episodeOrder" in item and item["episodeOrder"] is not None)
-      make_banner(img_url,page_id)
-
-      # Set URLs based on USE_AWS setting
-      if USE_AWS.lower() == "yes":
-          banner = f"https://{BUCKET}.s3.{AWS_REGION}.amazonaws.com/{page_id}.jpg"
-          poster = f"https://{BUCKET}.s3.{AWS_REGION}.amazonaws.com/{page_id}_poster.jpg"
-      else:
-          banner = img_url
-          poster = img_url
-
-      # print("Build Notion Update")
-      update_data = {
-      "cover":{
-         "external":{
-            "url":banner
-         }
-      },
-      "properties": {
-        "TVDBID": {
-            "number": thetvdb
-        },
-        "tvmazeID": {
-            "number": tv_id
-        },
-        "Type": {
-            "select": {
-                "name": "TV Serie"
-            }
-        },
-        "Show Status": {
-            "select": {
-                "name": status
-            }
-        },
-        "Premiered":{
-            "type":"date",
-            "date": premiered
-        },
-        "Ended": {
-            "type": "date",
-            "date": ended
-        },
-        "Last Aired Episode": {
-            "type": "number",
-            "number": last_episode
-        },
-        "Seasons": {
-            "number": season_count
-        },
-         "Poster":{
-            "type":"files",
-            "files":[
-               {
-                  "name":"Poster",
-                  "type":"external",
-                  "external":{
-                     "url":poster
-                  }
-               }
-            ]
-         },
-        "Total Eps.": {
-            "number": total_episodes
-        },
-         "Summary":{
-            "type":"rich_text",
-            "rich_text":[
-               {
-                  "type":"text",
-                  "text":{
-                     "content":summary
-                  }
-               }
-            ]
-         },
-        "Name": {
-            "type": "title",
-            "title": [
-                {
-                    "type": "text",
-                    "text": {
-                        "content": name
-                  }
-               }
-            ]
-         }
-      }
-   }
-
-      # print("Now Update the page in Notion")
-      update_page(page_id,update_data)
-      os.remove(page_id+".jpg")
-      if os.path.exists(page_id+"_poster.jpg"):
-          os.remove(page_id+"_poster.jpg")
-
-# Run cleanup once at startup if enabled
-if AWS_CLEANUP.lower() == "yes":
-    cleanup_aws_images()
-    # Schedule daily cleanup
-    schedule.every().day.do(cleanup_aws_images)
-    logging.info("AWS cleanup scheduled to run daily")
-
-schedule.every(60).seconds.do(read_pages)
-schedule.every().sunday.do(new_ep_check)
-logging.info("Next scan scheduled...")
-
-while True:
-    schedule.run_pending()
-    time.sleep(1)
+    return update_page(page_id, {"cover": {"external": {"url": cover}}, "properties": properties})
 
 
+# ---------------------------------------------------------------- Notion
+
+def get_pages():
+    """Return all pages in the database, or [] if Notion can't be reached."""
+    url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
+    payload = {"page_size": 100}
+    results = []
+    while True:
+        try:
+            response = requests.post(url, json=payload, headers=NOTION_headers, timeout=HTTP_TIMEOUT)
+            data = response.json()
+        except (requests.exceptions.RequestException, ValueError) as e:
+            logging.error(f"Error fetching Notion pages: {e}")
+            return []
+        if "results" not in data:
+            logging.error(f"Error fetching Notion pages: {data}")
+            return []
+        results.extend(data["results"])
+        if not data.get("has_more"):
+            return results
+        payload["start_cursor"] = data["next_cursor"]
+
+
+def update_page(page_id, data):
+    try:
+        res = requests.patch(f"https://api.notion.com/v1/pages/{page_id}",
+                             json=data, headers=NOTION_headers, timeout=HTTP_TIMEOUT)
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Notion update of {page_id} failed: {e}")
+        return False
+    if res.status_code == 200:
+        logging.info("Notion page updated")
+        return True
+    try:
+        error = res.json()
+    except ValueError:
+        error = {"message": res.text}
+    logging.error(f"Notion update of {page_id} failed ({res.status_code}): {error}")
+    send_push(f"{error.get('status', res.status_code)}: {error.get('code', 'error')}",
+              error.get("message", "No error message"))
+    return False
+
+
+# ---------------------------------------------------------------- jobs
+
+def read_pages():
+    """Fill in pages that have a name but no tvmazeID / tmdbID yet."""
+    for page in get_pages():
+        page_id = page.get("id")
+        title = ""
+        try:
+            props = page["properties"]
+            title = get_title(props)
+            if not title:
+                continue
+
+            content_type = get_select(props, "Type")
+            is_movie = content_type == TYPE_MOVIE
+            if get_number(props, "tmdbID" if is_movie else "tvmazeID") is not None:
+                continue
+            if (page_id, title) in failed_lookups:
+                continue
+
+            search_title = title.replace(";", "")
+            if is_movie:
+                data = get_movie_by_name(search_title)
+                ok = data is not None and update_movie_data(data, page_id)
+            else:
+                data = get_tv_by_name(search_title)
+                ok = data is not None and update_tv_data(data, page_id)
+
+            if not ok:
+                logging.warning(f"No match for '{title}' ({content_type or 'no type'}); "
+                                "retrying when the title changes")
+                failed_lookups.add((page_id, title))
+        except Exception as e:
+            logging.exception(f"Error processing page {page_id} '{title}': {e}")
+            failed_lookups.add((page_id, title))
+
+
+def new_ep_check():
+    """Weekly refresh: new episodes / status changes for shows, status for unreleased movies."""
+    for page in get_pages():
+        page_id = page.get("id")
+        title = ""
+        try:
+            props = page["properties"]
+            title = get_title(props)
+
+            tv_id = get_number(props, "tvmazeID")
+            if tv_id is not None:
+                tv_data = get_tv_by_id(tv_id)
+                if not tv_data:
+                    continue
+                changed = (
+                    get_number(props, "Last Aired Episode") != episode_id_from_link(tv_data, "previousepisode")
+                    or get_select(props, "Show Status") != tv_data.get("status")
+                )
+                if changed:
+                    logging.info(f"'{title}' has changed on TVmaze, updating")
+                    update_tv_data(tv_data, page_id)
+                continue
+
+            tmdb_id = get_number(props, "tmdbID")
+            if tmdb_id is not None and get_select(props, "Show Status") not in ("Released", "Canceled"):
+                movie_data = get_movie_by_id(tmdb_id)
+                if movie_data and movie_data.get("status") != get_select(props, "Show Status"):
+                    logging.info(f"Movie '{title}' status changed, updating")
+                    update_movie_data(movie_data, page_id)
+        except Exception as e:
+            logging.exception(f"Error checking page {page_id} '{title}': {e}")
+
+
+def safe(job):
+    """Wrap a scheduled job so an unexpected error never stops the scheduler."""
+    def wrapper():
+        try:
+            job()
+        except Exception as e:
+            logging.exception(f"{job.__name__} failed: {e}")
+    wrapper.__name__ = job.__name__
+    return wrapper
+
+
+if __name__ == "__main__":
+    if AWS_CLEANUP:
+        safe(cleanup_aws_images)()
+        schedule.every().day.do(safe(cleanup_aws_images))
+        logging.info("AWS cleanup scheduled to run daily")
+
+    schedule.every(60).seconds.do(safe(read_pages))
+    schedule.every().sunday.at("22:00").do(safe(new_ep_check))
+    logging.info("Next scan scheduled...")
+
+    while True:
+        schedule.run_pending()
+        time.sleep(1)

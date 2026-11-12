@@ -1,4 +1,5 @@
-###### Requirements without Version Specifiers ######
-request
-pillow
+requests
+schedule
 boto3
+pillow
+beautifulsoup4

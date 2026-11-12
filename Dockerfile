@@ -18,12 +18,8 @@ WORKDIR /app
 
 # Switch to the non-privileged user to run the application.
 
-RUN apt-get update && apt-get install -y git
-RUN pip3 install --upgrade pip --user
-RUN pip3 install --upgrade awscli
-RUN pip3 install git+https://github.com/Wyattjoh/pushover
-RUN pip3 install ndg-httpsclient pyopenssl pyasn1 urllib3
-RUN pip3 install requests datetime schedule boto3 pillow beautifulsoup4 --user
+COPY requirements.txt .
+RUN pip3 install --no-cache-dir -r requirements.txt
 # Copy the source code into the container.
 COPY . .
 
@@ -31,4 +27,4 @@ COPY . .
 EXPOSE 3333
 
 # Run the application.
-CMD python3 main.py
+CMD ["python3", "main.py"]

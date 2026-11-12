@@ -1,2 +1,4 @@
 compose.yaml
 .DS_Store
+.env
+__pycache__/
